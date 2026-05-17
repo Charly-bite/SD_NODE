@@ -1,0 +1,558 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+\usepackage{float}
+
+\geometry{margin=2.5cm}
+
+% Colores
+\definecolor{codeblue}{RGB}{0,80,180}
+\definecolor{codegray}{RGB}{100,100,100}
+\definecolor{codegreen}{RGB}{0,120,60}
+\definecolor{codebg}{RGB}{245,245,250}
+\definecolor{errorred}{RGB}{180,30,30}
+
+% Estilo de código
+\lstset{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\small,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codeblue}\bfseries,
+    stringstyle=\color{errorred},
+    numbers=left,
+    numberstyle=\tiny\color{codegray},
+    numbersep=8pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    frame=single,
+    rulecolor=\color{codegray},
+    tabsize=2,
+    xleftmargin=1.5em,
+    framexleftmargin=1em
+}
+
+\lstdefinelanguage{powershell}{
+    morekeywords={foreach, if, else, param, switch, Write-Host, multipass, sudo, bash, systemctl, curl, Start-Sleep},
+    sensitive=false,
+    morecomment=[l]{\#},
+    morestring=[b]",
+}
+
+% Encabezado
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Clúster Distribuido con Multipass}
+\fancyhead[R]{\small \thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=codeblue,
+    urlcolor=codeblue,
+}
+
+\title{
+    \vspace{-1cm}
+    {\LARGE \textbf{Documentación del Clúster de Sistemas Distribuidos}} \\[0.5em]
+    {\large Implementación con Canonical Multipass en Windows}
+}
+\author{Proyecto de Sistemas Distribuidos}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introducción}
+
+Este documento describe la infraestructura y los comandos utilizados para implementar un clúster de \textbf{3 nodos} de sistemas distribuidos utilizando \textbf{Canonical Multipass} sobre Windows. El clúster implementa:
+
+\begin{itemize}
+    \item Máquinas virtuales Ubuntu 24.04 LTS con recursos compartidos
+    \item Almacenamiento compartido vía \textbf{NFS} (Network File System)
+    \item Comunicación inter-nodos con \textbf{SSH sin contraseña}
+    \item Motor de contenedores \textbf{Docker} en cada nodo
+    \item Cola de tareas distribuida con \textbf{Redis} y \textbf{Python (Flask)}
+\end{itemize}
+
+% ============================================================
+\section{Arquitectura del Sistema}
+
+\subsection{Topología de Red}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Nodo} & \textbf{Rol Principal} & \textbf{Servicios} & \textbf{Imagen} \\
+\midrule
+node1 & Servidor / Productor & Redis, Flask API, NFS Server & Ubuntu 24.04 \\
+node2 & Worker / Cliente & Worker Python, NFS Client & Ubuntu 24.04 \\
+node3 & Worker / Cliente & Worker Python, NFS Client & Ubuntu 24.04 \\
+\bottomrule
+\end{tabular}
+\caption{Distribución de roles en el clúster}
+\end{table}
+
+\subsection{Recursos por Nodo}
+
+Cada nodo se configura con los siguientes recursos:
+\begin{itemize}
+    \item \textbf{CPU:} 2 núcleos virtuales
+    \item \textbf{RAM:} 2 GB
+    \item \textbf{Disco:} 10 GB
+\end{itemize}
+
+\subsection{Diagrama de Arquitectura}
+
+\begin{tcolorbox}[colback=codebg, colframe=codegray, title=Flujo de Procesamiento Distribuido]
+\begin{verbatim}
+  Cliente HTTP
+       |
+       v
+  [node1: Flask :5000]  ---LPUSH--->  [node1: Redis :6379]
+                                          |           |
+                                       BRPOP       BRPOP
+                                          |           |
+                                          v           v
+                                  [node2: Worker] [node3: Worker]
+                                          \           /
+                                           \         /
+                                        [/shared (NFS)]
+\end{verbatim}
+\end{tcolorbox}
+
+% ============================================================
+\section{Estructura de Archivos del Proyecto}
+
+\begin{lstlisting}[language={}, title=Estructura del directorio]
+Multipass_Cluster/
+  multipass-init.yaml       # Config cloud-init
+  setup_cluster.ps1         # Paso 1: Lanzar nodos
+  configure_cluster.ps1     # Paso 2: Configurar NFS
+  deploy_app.ps1            # Paso 3: Desplegar app
+  manage_cluster.ps1        # Utilidad de gestion
+  app/
+    producer.py             # API Flask (productor)
+    worker.py               # Consumidor de tareas
+    requirements.txt        # Dependencias Python
+\end{lstlisting}
+
+% ============================================================
+\section{Paso 1: Inicialización del Clúster (setup\_cluster.ps1)}
+
+\subsection{Cloud-Init (multipass-init.yaml)}
+
+El archivo de cloud-init configura cada nodo automáticamente al momento de su creación:
+
+\begin{lstlisting}[language=bash, title=multipass-init.yaml]
+#cloud-config
+users:
+  - name: distadmin
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo, docker]
+    shell: /bin/bash
+    lock_passwd: false
+
+chpasswd:
+  list: |
+     distadmin:tera
+  expire: False
+
+packages:
+  - openssh-server
+  - curl, git, build-essential
+  - docker.io
+  - nfs-kernel-server, nfs-common
+  - net-tools, htop
+  - python3, python3-pip, python3-venv
+
+runcmd:
+  - [ systemctl, enable, ssh ]
+  - [ systemctl, enable, docker ]
+  - [ mkdir, -p, /shared ]
+  - [ chown, -R, "distadmin:distadmin", /shared ]
+  - [ chmod, 777, /shared ]
+  - [ mkdir, -p, /home/distadmin/.ssh ]
+  - [ chmod, 700, /home/distadmin/.ssh ]
+\end{lstlisting}
+
+\subsection{Lanzamiento de Nodos}
+
+\begin{lstlisting}[language=powershell, title=Comando de lanzamiento]
+# Lanzar cada nodo con los recursos definidos
+multipass launch 24.04 --name node1 --cpus 2 `
+    --memory 2G --disk 10G --cloud-init multipass-init.yaml
+multipass launch 24.04 --name node2 --cpus 2 `
+    --memory 2G --disk 10G --cloud-init multipass-init.yaml
+multipass launch 24.04 --name node3 --cpus 2 `
+    --memory 2G --disk 10G --cloud-init multipass-init.yaml
+
+# Esperar a que cloud-init termine
+multipass exec node1 -- cloud-init status --wait
+\end{lstlisting}
+
+\subsection{Configuración de /etc/hosts}
+
+Se obtienen las direcciones IP de cada nodo y se registran en \texttt{/etc/hosts} de todos los nodos para permitir la resolución de nombres:
+
+\begin{lstlisting}[language=powershell, title=Registro de hostnames]
+# Obtener IP de un nodo
+$ipInfo = multipass info node1 --format csv | ConvertFrom-Csv
+
+# Inyectar entradas en /etc/hosts de cada nodo
+multipass exec node1 -- sudo bash -c `
+    "echo -e '172.x.x.x node1\n172.x.x.x node2\n172.x.x.x node3' >> /etc/hosts"
+\end{lstlisting}
+
+\subsection{SSH Sin Contraseña}
+
+Se genera un par de claves RSA compartido y se distribuye a todos los nodos:
+
+\begin{lstlisting}[language=powershell, title=Distribución de claves SSH]
+# Generar clave compartida
+ssh-keygen -t rsa -b 4096 -f $keyFile -N '""' -q
+
+# Instalar en cada nodo
+multipass exec node1 -- bash -c "echo '$privKey' > /home/distadmin/.ssh/id_rsa"
+multipass exec node1 -- chmod 600 /home/distadmin/.ssh/id_rsa
+multipass exec node1 -- bash -c "echo '$pubKey' >> /home/distadmin/.ssh/authorized_keys"
+
+# Pre-agregar a known_hosts para evitar el prompt inicial
+multipass exec node1 -- sudo -u distadmin bash -c `
+    "ssh-keyscan -H node2 >> /home/distadmin/.ssh/known_hosts"
+\end{lstlisting}
+
+% ============================================================
+\section{Paso 2: Configuración de Servicios (configure\_cluster.ps1)}
+
+\subsection{Servidor NFS (node1)}
+
+\begin{lstlisting}[language=powershell, title=Configuración del servidor NFS]
+# Exportar el directorio /shared
+multipass exec node1 -- sudo bash -c `
+    "echo '/shared *(rw,sync,no_subtree_check,no_root_squash)' > /etc/exports"
+multipass exec node1 -- sudo exportfs -arv
+multipass exec node1 -- sudo systemctl restart nfs-kernel-server
+\end{lstlisting}
+
+\subsection{Clientes NFS (node2, node3)}
+
+\begin{lstlisting}[language=powershell, title=Montaje de NFS en clientes]
+# Agregar entrada a fstab para persistencia
+multipass exec node2 -- sudo bash -c `
+    "echo '${nfsServer}:/shared /shared nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0' >> /etc/fstab"
+multipass exec node2 -- sudo mount -a
+\end{lstlisting}
+
+\subsection{Verificación de Docker}
+
+\begin{lstlisting}[language=powershell, title=Verificación de Docker]
+multipass exec node1 -- docker --version
+# Salida esperada: Docker version 27.x.x, build ...
+\end{lstlisting}
+
+% ============================================================
+\section{Paso 3: Despliegue de la Aplicación (deploy\_app.ps1)}
+
+\subsection{Transferencia de Archivos}
+
+\begin{lstlisting}[language=powershell, title=Transferencia vía multipass]
+# Crear directorio destino
+multipass exec node1 -- sudo mkdir -p /shared/app
+multipass exec node1 -- sudo chmod 777 /shared/app
+
+# Transferir archivos al nodo
+multipass transfer producer.py "node1:producer.py"
+multipass exec node1 -- sudo cp "producer.py" "/shared/app/producer.py"
+\end{lstlisting}
+
+\subsection{Instalación de Redis}
+
+\begin{lstlisting}[language=powershell, title=Configuración de Redis]
+# Instalar Redis
+multipass exec node1 -- sudo apt-get install -y redis-server
+
+# Configurar para escuchar en todas las interfaces
+multipass exec node1 -- sudo bash -c "echo 'bind 0.0.0.0' >> /etc/redis/redis.conf"
+multipass exec node1 -- sudo bash -c "echo 'protected-mode no' >> /etc/redis/redis.conf"
+multipass exec node1 -- sudo systemctl restart redis-server
+
+# Verificar que Redis escucha en el puerto correcto
+multipass exec node1 -- sudo ss -tlnp | findstr 6379
+# Esperado: LISTEN 0 511 0.0.0.0:6379 0.0.0.0:*
+\end{lstlisting}
+
+\subsection{Entorno Virtual de Python}
+
+\begin{lstlisting}[language=powershell, title=Configuración del entorno Python]
+multipass exec node1 -- bash -c `
+    "python3 -m venv /shared/app/venv && `
+     /shared/app/venv/bin/pip install -r /shared/app/requirements.txt"
+\end{lstlisting}
+
+\subsection{Servicios systemd}
+
+En lugar de usar \texttt{nohup} (que no persiste en sesiones de multipass exec), se crean servicios \texttt{systemd}:
+
+\begin{lstlisting}[language=bash, title=producer.service (node1)]
+[Unit]
+Description=Distributed Task Queue Producer
+After=network.target
+
+[Service]
+Type=simple
+User=distadmin
+WorkingDirectory=/shared/app
+ExecStart=/shared/app/venv/bin/python /shared/app/producer.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/shared/app/producer.log
+StandardError=append:/shared/app/producer.log
+
+[Install]
+WantedBy=multi-user.target
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash, title=worker.service (node2 y node3)]
+[Unit]
+Description=Distributed Task Queue Worker
+After=network.target
+
+[Service]
+Type=simple
+User=distadmin
+WorkingDirectory=/shared/app
+ExecStart=/shared/app/venv/bin/python /shared/app/worker.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/shared/app/worker.log
+StandardError=append:/shared/app/worker.log
+
+[Install]
+WantedBy=multi-user.target
+\end{lstlisting}
+
+\begin{lstlisting}[language=powershell, title=Activación de servicios]
+# Activar el productor en node1
+multipass exec node1 -- sudo systemctl daemon-reload
+multipass exec node1 -- sudo systemctl restart producer.service
+
+# Activar workers en node2 y node3
+multipass exec node2 -- sudo systemctl daemon-reload
+multipass exec node2 -- sudo systemctl restart worker.service
+multipass exec node3 -- sudo systemctl daemon-reload
+multipass exec node3 -- sudo systemctl restart worker.service
+\end{lstlisting}
+
+% ============================================================
+\section{Código de la Aplicación}
+
+\subsection{Productor (producer.py)}
+
+\begin{lstlisting}[language=Python, title=producer.py --- API Flask]
+from flask import Flask, request, jsonify
+import redis, time, socket
+
+app = Flask(__name__)
+r = redis.Redis(host='node1', port=6379, db=0)
+
+@app.route('/')
+def index():
+    return jsonify({
+        "status": "online",
+        "service": "producer",
+        "hostname": socket.gethostname()
+    })
+
+@app.route('/enqueue', methods=['GET', 'POST'])
+def enqueue():
+    task_id = request.args.get('task', f"task_{int(time.time())}")
+    r.lpush('task_queue', task_id)
+    return jsonify({
+        "message": f"Task '{task_id}' enqueued successfully",
+        "queue_length": r.llen('task_queue')
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+\end{lstlisting}
+
+\subsection{Worker (worker.py)}
+
+\begin{lstlisting}[language=Python, title=worker.py --- Consumidor de tareas]
+import redis, time, socket, logging
+
+logging.basicConfig(level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] (%(hostname)s) %(message)s')
+hostname = socket.gethostname()
+logger = logging.LoggerAdapter(
+    logging.getLogger(__name__), {'hostname': hostname})
+
+r = redis.Redis(host='node1', port=6379, db=0)
+
+def worker():
+    logger.info("Worker started, waiting for tasks...")
+    while True:
+        try:
+            task = r.brpop('task_queue', timeout=5)
+            if task:
+                queue_name, task_id = task
+                task_id = task_id.decode('utf-8')
+                logger.info(f"Picked up task: {task_id}")
+                time.sleep(2)  # Simular procesamiento
+                logger.info(f"Finished processing task: {task_id}")
+        except redis.ConnectionError:
+            logger.error("Could not connect to Redis. Retrying in 5s...")
+            time.sleep(5)
+
+if __name__ == '__main__':
+    worker()
+\end{lstlisting}
+
+% ============================================================
+\section{Verificación y Pruebas}
+
+\subsection{Comandos de Verificación}
+
+\begin{lstlisting}[language=powershell, title=Lista completa de verificaciones]
+# 1. Estado del cluster
+multipass list
+
+# 2. Conectividad de red entre nodos
+multipass exec node2 -- ping -c 2 node1
+multipass exec node3 -- ping -c 2 node1
+
+# 3. Almacenamiento compartido NFS
+multipass exec node1 -- touch /shared/test.txt
+multipass exec node3 -- ls /shared/test.txt
+
+# 4. Redis escuchando correctamente
+multipass exec node1 -- sudo ss -tlnp | findstr 6379
+
+# 5. API del productor respondiendo
+multipass exec node1 -- curl -s http://127.0.0.1:5000/
+\end{lstlisting}
+
+\subsection{Prueba de Procesamiento Distribuido}
+
+\begin{lstlisting}[language=powershell, title=Prueba end-to-end]
+# Enviar 4 tareas al productor
+multipass exec node1 -- curl -s "http://127.0.0.1:5000/enqueue?task=AnalyzeDatasetA"
+multipass exec node1 -- curl -s "http://127.0.0.1:5000/enqueue?task=AnalyzeDatasetB"
+multipass exec node1 -- curl -s "http://127.0.0.1:5000/enqueue?task=ProcessImageBatch"
+multipass exec node1 -- curl -s "http://127.0.0.1:5000/enqueue?task=TrainModelAlpha"
+
+# Esperar y revisar logs de los workers
+Start-Sleep -Seconds 10
+multipass exec node2 -- cat /shared/app/worker.log
+multipass exec node3 -- cat /shared/app/worker.log
+\end{lstlisting}
+
+\subsection{Resultados Esperados}
+
+La salida de los logs de los workers deberá mostrar:
+
+\begin{lstlisting}[language={}, title=Ejemplo de salida exitosa]
+# worker.log en node2:
+2026-05-17 16:04:35 [INFO] (node2) Worker started, waiting for tasks...
+2026-05-17 16:05:02 [INFO] (node2) Picked up task: AnalyzeDatasetA
+2026-05-17 16:05:04 [INFO] (node2) Finished processing task: AnalyzeDatasetA
+
+# worker.log en node3:
+2026-05-17 16:04:40 [INFO] (node3) Worker started, waiting for tasks...
+2026-05-17 16:05:02 [INFO] (node3) Picked up task: ProcessImageBatch
+2026-05-17 16:05:04 [INFO] (node3) Finished processing task: ProcessImageBatch
+\end{lstlisting}
+
+% ============================================================
+\section{Gestión del Clúster (manage\_cluster.ps1)}
+
+\begin{lstlisting}[language=powershell, title=Comandos de gestión]
+# Ver estado de todos los nodos
+.\manage_cluster.ps1 -Action status
+
+# Iniciar todos los nodos
+.\manage_cluster.ps1 -Action start
+
+# Detener todos los nodos
+.\manage_cluster.ps1 -Action stop
+
+# Reiniciar todos los nodos
+.\manage_cluster.ps1 -Action restart
+
+# Abrir shell en un nodo especifico
+.\manage_cluster.ps1 -Action shell -Node node2
+
+# Destruir el cluster completo
+.\manage_cluster.ps1 -Action destroy
+\end{lstlisting}
+
+% ============================================================
+\section{Errores Conocidos y Soluciones}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3cm}p{4.5cm}p{5.5cm}@{}}
+\toprule
+\textbf{Error} & \textbf{Causa} & \textbf{Solución} \\
+\midrule
+Variable \texttt{\$var:} no válida en PowerShell &
+PowerShell interpreta \texttt{\$var:} como cualificador de ámbito &
+Usar sintaxis \texttt{\$\{var\}} cuando la variable precede a dos puntos \\
+\midrule
+Redis bind \texttt{0.0.0.1} &
+Error tipográfico en el script original &
+Corregir a \texttt{0.0.0.0} \\
+\midrule
+\texttt{sed} no modifica redis.conf &
+El formato del archivo en Ubuntu 24.04 difiere del patrón buscado &
+Agregar \texttt{bind 0.0.0.0} y \texttt{protected-mode no} al final del archivo \\
+\midrule
+SFTP Permission Denied &
+Ruta de destino incorrecta en \texttt{multipass transfer} &
+Usar ruta relativa: \texttt{node1:archivo} en lugar de ruta absoluta \\
+\midrule
+Procesos \texttt{nohup} mueren &
+\texttt{multipass exec} termina la sesión bash y sus hijos &
+Usar servicios \texttt{systemd} para persistencia de procesos \\
+\bottomrule
+\end{tabular}
+\caption{Resumen de errores encontrados y sus correcciones}
+\end{table}
+
+% ============================================================
+\section{Conclusiones}
+
+Se implementó exitosamente un clúster de 3 nodos de sistemas distribuidos con las siguientes capacidades:
+
+\begin{enumerate}
+    \item \textbf{Virtualización:} Tres máquinas virtuales Ubuntu 24.04 administradas por Multipass.
+    \item \textbf{Red:} Resolución de nombres entre nodos vía \texttt{/etc/hosts} y comunicación SSH sin contraseña.
+    \item \textbf{Almacenamiento compartido:} Directorio \texttt{/shared} sincronizado vía NFS.
+    \item \textbf{Procesamiento distribuido:} Cola de tareas Redis consumida por workers en nodos independientes.
+    \item \textbf{Gestión de procesos:} Servicios \texttt{systemd} para la ejecución persistente de la aplicación.
+\end{enumerate}
+
+El sistema demostró la distribución efectiva de tareas entre \texttt{node2} y \texttt{node3}, verificando que ambos workers consumieron tareas de la cola Redis en \texttt{node1} de forma independiente y concurrente.
+
+\end{document}
